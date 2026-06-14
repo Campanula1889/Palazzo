@@ -45,6 +45,20 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+<script>
+const firebaseConfig = {
+  apiKey: "AIzaSyDUnXG-Zi-84903-3m4vY6QDnhjXm3QSzI",
+  authDomain: "palazzo-portfolio.firebaseapp.com",
+  projectId: "palazzo-portfolio",
+  storageBucket: "palazzo-portfolio.firebasestorage.app",
+  messagingSenderId: "684537510698",
+  appId: "1:684537510698:web:e0a29d652baf84f82fbc53"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+</script>
 <script type="text/babel">
 const {useState,useEffect,useCallback,useRef,useMemo}=React;
 
@@ -53,7 +67,6 @@ const SK="palazzo_v4";
 const DK="palazzo_daily_v4";
 const DIVK="palazzo_div_v4";
 // Finnhub 무료 API key (공개 데모키 사용)
-const FINNHUB_KEY="d0n6cu9r01qgs39c7vagd0n6cu9r01qgs39c7vb0";
 
 const ACCOUNTS=[
   // 계좌 유형
@@ -149,6 +162,27 @@ function today(){return new Date().toISOString().slice(0,10);}
 function loadJSON(key,def){try{const s=localStorage.getItem(key);return s?JSON.parse(s):def;}catch{return def;}}
 function saveJSON(key,val){try{localStorage.setItem(key,JSON.stringify(val));}catch{}}
 
+// ── Firebase 동기화 ──
+async function saveToCloud(holdings){
+  try{
+    await db.collection("portfolio").doc("holdings").set({
+      data: JSON.stringify(holdings),
+      updatedAt: new Date().toISOString()
+    });
+    return true;
+  }catch(e){console.error("Cloud save error:",e);return false;}
+}
+async function loadFromCloud(){
+  try{
+    const doc=await db.collection("portfolio").doc("holdings").get();
+    if(doc.exists){
+      const d=doc.data();
+      return JSON.parse(d.data);
+    }
+  }catch(e){console.error("Cloud load error:",e);}
+  return null;
+}
+
 // 이전 키 마이그레이션
 ["palazzo_portfolio_FINAL","palazzo_portfolio_v3","palazzo_portfolio_v2","palazzo_portfolio_v1"].forEach(ok=>{
   if(!localStorage.getItem(SK)){const d=localStorage.getItem(ok);if(d)localStorage.setItem(SK,d);}
@@ -158,6 +192,21 @@ function saveJSON(key,val){try{localStorage.setItem(key,JSON.stringify(val));}ca
 function App(){
   const [tab,setTab]=useState("home");
   const [holdings,setHoldings]=useState(()=>loadJSON(SK,DEFAULT_HOLDINGS));
+  const [cloudStatus,setCloudStatus]=useState(""); // "", "저장중", "저장됨", "오류"
+  const [cloudLoaded,setCloudLoaded]=useState(false);
+
+  // 앱 시작시 클라우드에서 불러오기
+  useEffect(()=>{
+    loadFromCloud().then(data=>{
+      if(data&&Array.isArray(data)&&data.length>0){
+        setHoldings(data);
+        saveJSON(SK,data);
+        setCloudStatus("클라우드 동기화됨 ✓");
+        setTimeout(()=>setCloudStatus(""),3000);
+      }
+      setCloudLoaded(true);
+    });
+  },[]);
   const [prices,setPrices]=useState({});
   const [prevPrices,setPrevPrices]=useState(()=>loadJSON(DK,{})); // 전일 종가
   const [divData,setDivData]=useState(()=>loadJSON(DIVK,{})); // 배당 데이터
@@ -168,53 +217,75 @@ function App(){
   const [holdingView,setHoldingView]=useState("평가"); // 시세 | 평가
   const [selectedH,setSelectedH]=useState(null); // 종목 상세
 
-  useEffect(()=>saveJSON(SK,holdings),[holdings]);
+  useEffect(()=>{
+    saveJSON(SK,holdings);
+    if(!cloudLoaded) return; // 초기 로드 중엔 저장 안함
+    setCloudStatus("저장중...");
+    saveToCloud(holdings).then(ok=>{
+      setCloudStatus(ok?"클라우드 저장됨 ✓":"로컬만 저장됨");
+      setTimeout(()=>setCloudStatus(""),3000);
+    });
+  },[holdings]);
 
-  // ── Finnhub 시세 조회 ──
+  // ── 실시간 시세 조회 (Yahoo Finance 프록시) ──
   const fetchPrices=useCallback(async()=>{
     setLoading(true);
     try{
-      // 환율
-      const fxRes=await fetch(`https://finnhub.io/api/v1/forex/rates?base=USD&token=${FINNHUB_KEY}`);
-      const fxData=await fxRes.json();
-      if(fxData?.quote?.KRW) setUsdKrw(fxData.quote.KRW);
+      const np={...prices};
 
-      const np={};
-      const usTickers=holdings.filter(h=>h.type!=="한국주식"&&h.type!=="크립토"&&!h.manualPrice).map(h=>h.ticker);
-      const cryptoTickers=holdings.filter(h=>h.type==="크립토"&&!h.manualPrice).map(h=>h.ticker);
+      // 환율 (USD/KRW)
+      try{
+        const fxR=await fetch("https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?interval=1d&range=1d",{mode:"cors"});
+        const fxD=await fxR.json();
+        const fx=fxD?.chart?.result?.[0]?.meta?.regularMarketPrice;
+        if(fx&&fx>900&&fx<2000) setUsdKrw(fx);
+      }catch{}
 
-      // 미국주식 - Finnhub quote
-      await Promise.all(usTickers.map(async t=>{
-        try{
-          const r=await fetch(`https://finnhub.io/api/v1/quote?symbol=${t}&token=${FINNHUB_KEY}`);
-          const d=await r.json();
-          if(d?.c>0){
-            np[t]=d.c;
-            // 전일 종가도 저장
-            if(d?.pc>0) np[`${t}_prev`]=d.pc;
+      // 자동시세 종목 (manualPrice 없는 것)
+      const autoH=holdings.filter(h=>h.type!=="한국주식"&&!h.manualPrice);
+      const tickers=autoH.map(h=>h.ticker);
+
+      if(tickers.length>0){
+        // Yahoo Finance: 여러 티커 한번에
+        const chunks=[];
+        for(let i=0;i<tickers.length;i+=10) chunks.push(tickers.slice(i,i+10));
+
+        await Promise.all(chunks.map(async chunk=>{
+          const syms=chunk.join(",");
+          try{
+            // 방법1: Yahoo Finance v7 (CORS 허용)
+            const r=await fetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${syms}&fields=regularMarketPrice,previousClose`,{mode:"cors"});
+            const d=await r.json();
+            const results=d?.quoteResponse?.result||[];
+            results.forEach(q=>{
+              if(q.regularMarketPrice>0){
+                np[q.symbol]=q.regularMarketPrice;
+                if(q.regularMarketPreviousClose>0) np[`${q.symbol}_prev`]=q.regularMarketPreviousClose;
+              }
+            });
+          }catch{
+            // 방법2: 개별 조회 fallback
+            await Promise.all(chunk.map(async t=>{
+              try{
+                const r2=await fetch(`https://query2.finance.yahoo.com/v8/finance/chart/${t}?interval=1d&range=2d`,{mode:"cors"});
+                const d2=await r2.json();
+                const meta=d2?.chart?.result?.[0]?.meta;
+                if(meta?.regularMarketPrice>0){
+                  np[t]=meta.regularMarketPrice;
+                  if(meta?.chartPreviousClose>0) np[`${t}_prev`]=meta.chartPreviousClose;
+                }
+              }catch{}
+            }));
           }
-        }catch{}
-      }));
+        }));
+      }
 
-      // 크립토 - Finnhub crypto
-      await Promise.all(cryptoTickers.map(async t=>{
-        const sym=t.replace("-USD","");
-        try{
-          const r=await fetch(`https://finnhub.io/api/v1/crypto/candle?symbol=BINANCE:${sym}USDT&resolution=D&count=2&token=${FINNHUB_KEY}`);
-          const d=await r.json();
-          if(d?.c?.length>0){
-            np[t]=d.c[d.c.length-1];
-            if(d.c.length>1) np[`${t}_prev`]=d.c[d.c.length-2];
-          }
-        }catch{}
-      }));
-
-      // 전일가 저장 (날짜 바뀌면)
+      // 전일 스냅샷 저장
       const snap=loadJSON(DK,{});
       if(!snap.date||snap.date!==today()){
         const newSnap={date:today(),prices:{}};
         holdings.forEach(h=>{
-          const prev=np[`${h.ticker}_prev`]||prices[h.ticker]||h.manualPrice;
+          const prev=np[`${h.ticker}_prev`]||np[h.ticker]||h.manualPrice;
           if(prev) newSnap.prices[h.ticker]=prev;
         });
         saveJSON(DK,newSnap);
@@ -223,7 +294,7 @@ function App(){
 
       setPrices(np);
       setLastUpd(new Date());
-    }catch(e){console.error(e);}
+    }catch(e){console.error("fetch error:",e);}
     setLoading(false);
   },[holdings,prices]);
 
@@ -256,7 +327,12 @@ function App(){
     saveJSON(DIVK,dd);
   },[holdings,divData]);
 
-  useEffect(()=>{fetchPrices();},[]);
+  useEffect(()=>{
+    fetchPrices();
+    // 5분마다 자동 새로고침
+    const timer=setInterval(()=>fetchPrices(),5*60*1000);
+    return()=>clearInterval(timer);
+  },[]);
 
   const getPrice=h=>h.manualPrice||(prices[h.ticker])||null;
   const getPrevPrice=h=>{
@@ -339,7 +415,7 @@ function App(){
 
   return(
     <div style={{background:"#0a0f1e",minHeight:"100dvh",paddingBottom:80}}>
-      {tab==="home"&&<HomeTab enriched={enriched} totalValue={totalValue} totalCost={totalCost} totalPnl={totalPnl} totalPnlPct={totalPnlPct} totalDailyPnl={totalDailyPnl} totalDailyPct={totalDailyPct} totalAnnualDiv={totalAnnualDiv} usdKrw={usdKrw} loading={loading} lastUpd={lastUpd} onRefresh={fetchPrices} sortedHoldings={sortedHoldings} priceSort={priceSort} setPriceSort={setPriceSort} holdingView={holdingView} setHoldingView={setHoldingView} onSelect={setSelectedH} exportData={exportData} importData={importData} byAccount={byAccount}/>}
+      {tab==="home"&&<HomeTab enriched={enriched} totalValue={totalValue} totalCost={totalCost} totalPnl={totalPnl} totalPnlPct={totalPnlPct} totalDailyPnl={totalDailyPnl} totalDailyPct={totalDailyPct} totalAnnualDiv={totalAnnualDiv} usdKrw={usdKrw} loading={loading} lastUpd={lastUpd} onRefresh={fetchPrices} sortedHoldings={sortedHoldings} priceSort={priceSort} setPriceSort={setPriceSort} holdingView={holdingView} setHoldingView={setHoldingView} onSelect={setSelectedH} exportData={exportData} importData={importData} byAccount={byAccount} cloudStatus={cloudStatus}/>}
       {tab==="dividend"&&<DividendTab enriched={enriched} usdKrw={usdKrw} totalAnnualDiv={totalAnnualDiv} onFetch={fetchDividends} divData={divData}/>}
       {tab==="allocation"&&<AllocationTab enriched={enriched} totalValue={totalValue}/>}
       {tab==="holdings"&&<HoldingsTab enriched={enriched} holdings={holdings} setHoldings={setHoldings} usdKrw={usdKrw} totalValue={totalValue}/>}
@@ -358,7 +434,7 @@ function App(){
 }
 
 // ── 홈 탭 ──────────────────────────────────────────────
-function HomeTab({enriched,totalValue,totalCost,totalPnl,totalPnlPct,totalDailyPnl,totalDailyPct,totalAnnualDiv,usdKrw,loading,lastUpd,onRefresh,sortedHoldings,priceSort,setPriceSort,holdingView,setHoldingView,onSelect,exportData,importData,byAccount=[]}){
+function HomeTab({enriched,totalValue,totalCost,totalPnl,totalPnlPct,totalDailyPnl,totalDailyPct,totalAnnualDiv,usdKrw,loading,lastUpd,onRefresh,sortedHoldings,priceSort,setPriceSort,holdingView,setHoldingView,onSelect,exportData,importData,byAccount=[],cloudStatus=""}){
   const hasDailyData=totalDailyPnl!==0||enriched.some(h=>h.dailyPnl!=null);
   return(
     <div style={{padding:"0 14px 14px"}}>
@@ -368,7 +444,8 @@ function HomeTab({enriched,totalValue,totalCost,totalPnl,totalPnlPct,totalDailyP
           <div style={{fontSize:10,color:"#64748b",fontWeight:700,letterSpacing:1}}>PALAZZO INVESTMENT</div>
           <div style={{fontSize:15,fontWeight:800,letterSpacing:-0.5}}>총 자산</div>
         </div>
-        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+          {cloudStatus&&<div style={{fontSize:10,color:"#22c55e",fontWeight:600}}>{cloudStatus}</div>}
           <button onClick={onRefresh} disabled={loading} style={{background:"transparent",border:"1px solid #1e293b",borderRadius:8,padding:"6px 10px",color:loading?"#334155":"#3b82f6",fontSize:12,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>
             {loading?<><span className="spinner"/><span>조회중</span></>:<span>↻ 새로고침</span>}
           </button>
