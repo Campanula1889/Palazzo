@@ -56,7 +56,7 @@ firebase.initializeApp({
 const db=firebase.firestore();
 </script>
 <script type="text/babel">
-const {useState,useEffect,useCallback,useMemo}=React;
+const {useState,useEffect,useCallback,useMemo,useRef}=React;
 
 // ── 스토리지 키 ──
 const SK="palazzo_v5";
@@ -203,6 +203,22 @@ function App(){
     });
   },[holdings,realized]);
 
+  // 자산 추이 저장 - TV가 업데이트될 때 (새로고침 후)
+  const chartSavedToday=useRef(false);
+  useEffect(()=>{
+    if(TV<=0||!cloudReady) return;
+    const todayStr=today();
+    setChartData(prev=>{
+      if(prev.find(d=>d.date===todayStr)) return prev; // 오늘 이미 저장
+      if(chartSavedToday.current) return prev;
+      chartSavedToday.current=true;
+      const updated=[...prev,{date:todayStr,value:TV,cost:TC}].slice(-365);
+      save(CK,updated);
+      db.collection("palazzo").doc("chart").set({data:JSON.stringify(updated),updatedAt:new Date().toISOString()}).catch(()=>{});
+      return updated;
+    });
+  },[TV]);
+
   const getPrice=h=>h.manualPrice||prices[h.ticker]||null;
   const getPrev=h=>prevSnap?.prices?.[h.ticker]||prices[`${h.ticker}_prev`]||null;
 
@@ -239,19 +255,6 @@ function App(){
         save(DK,ns);setPrevSnap(ns);
       }
       setPrices(np);setLastUpd(new Date());
-      // 자산 추이 저장 (하루 1번)
-      if(TV>0){
-        const todayStr=today();
-        setChartData(prev=>{
-          const exists=prev.find(d=>d.date===todayStr);
-          if(exists) return prev;
-          const updated=[...prev,{date:todayStr,value:TV,cost:TC}].slice(-365); // 최대 1년
-          save(CK,updated);
-          // Firebase에도 저장
-          db.collection("palazzo").doc("chart").set({data:JSON.stringify(updated),updatedAt:new Date().toISOString()}).catch(()=>{});
-          return updated;
-        });
-      }
     }catch{}
     setLoading(false);
   },[holdings]);
